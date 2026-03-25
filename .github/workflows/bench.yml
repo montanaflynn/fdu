@@ -1,0 +1,70 @@
+name: Benchmark
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  bench:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+
+      - name: Create test tree (unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p bench_data
+          for i in $(seq 1 10); do
+            for j in $(seq 1 10); do
+              dir="bench_data/dir_$i/sub_$j"
+              mkdir -p "$dir"
+              for k in $(seq 1 100); do
+                dd if=/dev/urandom of="$dir/file_$k.bin" bs=1024 count=$((k % 50 + 1)) 2>/dev/null
+              done
+            done
+          done
+          echo "--- Test tree: 10,000 files ---"
+          du -sh bench_data
+
+      - name: Create test tree (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          foreach ($i in 1..10) {
+            foreach ($j in 1..10) {
+              $dir = "bench_data/dir_$i/sub_$j"
+              New-Item -ItemType Directory -Path $dir -Force | Out-Null
+              foreach ($k in 1..100) {
+                $size = (($k % 50) + 1) * 1024
+                $bytes = New-Object byte[] $size
+                (New-Object Random).NextBytes($bytes)
+                [IO.File]::WriteAllBytes("$dir/file_$k.bin", $bytes)
+              }
+            }
+          }
+          Write-Output "--- Test tree: 10,000 files ---"
+
+      - name: Run benchmark (unix)
+        if: runner.os != 'Windows'
+        run: |
+          echo "=== fdu ==="
+          time ./target/release/fdu bench_data --no-tui
+          echo ""
+          echo "=== fdu --files-only ==="
+          time ./target/release/fdu bench_data --no-tui --files-only
+
+      - name: Run benchmark (windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          echo "=== fdu ==="
+          time ./target/release/fdu.exe bench_data --no-tui
+          echo ""
+          echo "=== fdu --files-only ==="
+          time ./target/release/fdu.exe bench_data --no-tui --files-only
