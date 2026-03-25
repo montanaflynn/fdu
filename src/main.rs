@@ -1139,7 +1139,10 @@ mod tests {
 
     #[test]
     fn shorten_path_under_home() {
-        let home = std::env::var("HOME").expect("HOME must be set");
+        let home = match std::env::var("HOME") {
+            Ok(h) => h,
+            Err(_) => return, // skip on Windows where HOME isn't set
+        };
         let input = format!("{}/Documents/file.txt", home);
         assert_eq!(shorten_path(&input), "~/Documents/file.txt");
     }
