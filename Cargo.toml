@@ -9,9 +9,14 @@ keywords = ["disk", "usage", "tui", "du", "filesystem"]
 categories = ["command-line-utilities", "filesystem"]
 
 [dependencies]
-jwalk = "0.8"
 rayon = "1"
 ratatui = "0.29"
 crossterm = "0.28"
 clap = { version = "4", features = ["derive"] }
 humansize = "2"
+
+[target.'cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))'.dependencies]
+jwalk = "0.8"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }

@@ -1,6 +1,3 @@
-// TODO: Implement getdents64 + statx + rayon parallel walker
-// For now, delegate to a simple rayon + std::fs approach
-
 use std::{
     collections::HashMap,
     path::PathBuf,
