@@ -8,7 +8,6 @@ use std::{
     },
 };
 
-use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{
     FindClose, FindFirstFileExW, FindNextFileW, FindExInfoBasic, FindExSearchNameMatch,
     FIND_FIRST_EX_LARGE_FETCH, WIN32_FIND_DATAW, FILE_ATTRIBUTE_DIRECTORY,
@@ -90,7 +89,7 @@ fn walk_dir<'s>(
             FindExInfoBasic,
             &mut find_data as *mut _ as *mut _,
             FindExSearchNameMatch,
-            std::ptr::null(),
+            None,
             FIND_FIRST_EX_LARGE_FETCH,
         )
     };
