@@ -1,0 +1,17 @@
+[package]
+name = "fdu"
+version = "0.1.0"
+edition = "2021"
+description = "Fast disk usage analyzer with a streaming TUI"
+license = "MIT"
+repository = "https://github.com/montanaflynn/fdu"
+keywords = ["disk", "usage", "tui", "du", "filesystem"]
+categories = ["command-line-utilities", "filesystem"]
+
+[dependencies]
+jwalk = "0.8"
+rayon = "1"
+ratatui = "0.29"
+crossterm = "0.28"
+clap = { version = "4", features = ["derive"] }
+humansize = "2"
