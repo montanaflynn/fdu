@@ -1,3 +1,5 @@
+mod scanner;
+
 use clap::Parser;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -14,7 +16,6 @@ use ratatui::{
     Terminal,
 };
 use std::{
-    collections::HashMap,
     io,
     path::PathBuf,
     sync::{
@@ -50,24 +51,24 @@ struct Cli {
 }
 
 #[derive(Clone)]
-struct SizeEntry {
-    path: String,
-    size: u64,
+pub(crate) struct SizeEntry {
+    pub path: String,
+    pub size: u64,
 }
 
-struct ScanLists {
-    top_files: Vec<SizeEntry>,
-    top_dirs: Vec<SizeEntry>,
-    current_path: String,
+pub(crate) struct ScanLists {
+    pub top_files: Vec<SizeEntry>,
+    pub top_dirs: Vec<SizeEntry>,
+    pub current_path: String,
 }
 
-struct ScanState {
-    lists: Mutex<ScanLists>,
-    total_bytes: AtomicU64,
-    file_count: AtomicU64,
-    dir_count: AtomicU64,
-    error_count: AtomicU64,
-    done: AtomicBool,
+pub(crate) struct ScanState {
+    pub lists: Mutex<ScanLists>,
+    pub total_bytes: AtomicU64,
+    pub file_count: AtomicU64,
+    pub dir_count: AtomicU64,
+    pub error_count: AtomicU64,
+    pub done: AtomicBool,
 }
 
 impl ScanState {
@@ -113,7 +114,7 @@ fn home_dir() -> Option<String> {
     std::env::var("HOME").ok()
 }
 
-fn shorten_path(path: &str) -> String {
+pub(crate) fn shorten_path(path: &str) -> String {
     if let Some(home) = home_dir() {
         if let Some(rest) = path.strip_prefix(&home) {
             return format!("~{}", rest);
@@ -122,7 +123,7 @@ fn shorten_path(path: &str) -> String {
     path.to_string()
 }
 
-fn insert_top_n(list: &mut Vec<SizeEntry>, entry: SizeEntry, n: usize) {
+pub(crate) fn insert_top_n(list: &mut Vec<SizeEntry>, entry: SizeEntry, n: usize) {
     let pos = list
         .binary_search_by(|e| entry.size.cmp(&e.size))
         .unwrap_or_else(|p| p);
@@ -133,503 +134,6 @@ fn insert_top_n(list: &mut Vec<SizeEntry>, entry: SizeEntry, n: usize) {
             list.pop();
         }
     }
-}
-
-// ─── macOS: getattrlistbulk + rayon parallel walker ───────────────────────────
-
-#[cfg(target_os = "macos")]
-mod bulk {
-    use std::os::fd::RawFd;
-
-    pub const ATTR_BIT_MAP_COUNT: u16 = 5;
-    pub const ATTR_CMN_RETURNED_ATTRS: u32 = 0x80000000;
-    pub const ATTR_CMN_NAME: u32 = 0x00000001;
-    pub const ATTR_CMN_OBJTYPE: u32 = 0x00000008;
-    pub const ATTR_FILE_DATAALLOCSIZE: u32 = 0x00000400;
-    pub const VREG: u32 = 1;
-    pub const VDIR: u32 = 2;
-
-    #[repr(C)]
-    pub struct AttrList {
-        pub bitmapcount: u16,
-        pub reserved: u16,
-        pub commonattr: u32,
-        pub volattr: u32,
-        pub dirattr: u32,
-        pub fileattr: u32,
-        pub forkattr: u32,
-    }
-
-    unsafe extern "C" {
-        pub fn getattrlistbulk(
-            dirfd: i32,
-            alist: *const AttrList,
-            attribute_buffer: *mut u8,
-            buffer_size: usize,
-            options: u64,
-        ) -> i32;
-    }
-
-    pub struct BulkEntry {
-        pub name: String,
-        pub obj_type: u32,
-        pub size: u64,
-    }
-
-    fn read_u32(buf: &[u8], off: usize) -> u32 {
-        u32::from_ne_bytes(buf[off..off + 4].try_into().unwrap())
-    }
-
-    fn read_i32(buf: &[u8], off: usize) -> i32 {
-        i32::from_ne_bytes(buf[off..off + 4].try_into().unwrap())
-    }
-
-    pub fn read_dir_bulk(fd: RawFd) -> Vec<BulkEntry> {
-        let attrs = AttrList {
-            bitmapcount: ATTR_BIT_MAP_COUNT,
-            reserved: 0,
-            commonattr: ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_NAME | ATTR_CMN_OBJTYPE,
-            volattr: 0,
-            dirattr: 0,
-            fileattr: ATTR_FILE_DATAALLOCSIZE,
-            forkattr: 0,
-        };
-
-        const BUF_SIZE: usize = 256 * 1024;
-        let mut buf = vec![0u8; BUF_SIZE];
-        let mut entries = Vec::new();
-
-        loop {
-            let count = unsafe {
-                getattrlistbulk(fd, &attrs, buf.as_mut_ptr(), BUF_SIZE, 0)
-            };
-            if count <= 0 {
-                break;
-            }
-
-            let mut offset = 0usize;
-            for _ in 0..count as usize {
-                if offset + 28 > BUF_SIZE {
-                    break;
-                }
-
-                let entry_len = read_u32(&buf, offset) as usize;
-                let entry_start = offset;
-                offset += 4;
-
-                // returned_attrs: attribute_set_t (5 × u32 = 20 bytes)
-                let ret_common = read_u32(&buf, offset);
-                offset += 4;
-                offset += 4; // volattr
-                offset += 4; // dirattr
-                let ret_file = read_u32(&buf, offset);
-                offset += 4;
-                offset += 4; // forkattr
-
-                // Parse common attrs
-                let mut name = String::new();
-                let mut obj_type: u32 = 0;
-                let mut size: u64 = 0;
-
-                if ret_common & ATTR_CMN_NAME != 0 {
-                    let name_ref_offset = offset;
-                    let name_data_offset = read_i32(&buf, offset);
-                    let _name_length = read_u32(&buf, offset + 4);
-                    offset += 8;
-
-                    let name_start = (name_ref_offset as i64 + name_data_offset as i64) as usize;
-                    if name_start < entry_start + entry_len {
-                        // Read null-terminated string
-                        let end = buf[name_start..entry_start + entry_len]
-                            .iter()
-                            .position(|&b| b == 0)
-                            .map(|p| name_start + p)
-                            .unwrap_or(entry_start + entry_len);
-                        name = String::from_utf8_lossy(&buf[name_start..end]).to_string();
-                    }
-                }
-
-                if ret_common & ATTR_CMN_OBJTYPE != 0 {
-                    obj_type = read_u32(&buf, offset);
-                    offset += 4;
-                }
-
-                // Parse file attrs (only present for regular files)
-                if ret_file & ATTR_FILE_DATAALLOCSIZE != 0 {
-                    if offset + 8 <= entry_start + entry_len {
-                        size = u64::from_ne_bytes(
-                            buf[offset..offset + 8].try_into().unwrap(),
-                        );
-                    }
-                }
-
-                entries.push(BulkEntry {
-                    name,
-                    obj_type,
-                    size,
-                });
-
-                offset = entry_start + entry_len;
-            }
-        }
-
-        entries
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn scan(
-    state: Arc<ScanState>,
-    root: PathBuf,
-    top_n: usize,
-    files_only: bool,
-    stop: Arc<AtomicBool>,
-) {
-    let dir_sizes: Mutex<HashMap<PathBuf, u64>> = Mutex::new(HashMap::new());
-    let min_top_size = AtomicU64::new(0);
-    let dirs_processed = AtomicU64::new(0);
-
-    rayon::scope(|scope| {
-        walk_dir_bulk(
-            scope,
-            root.clone(),
-            &state,
-            &dir_sizes,
-            &min_top_size,
-            &dirs_processed,
-            &root,
-            top_n,
-            files_only,
-            &stop,
-        );
-    });
-
-    if !files_only {
-        flush_top_dirs(&state, &dir_sizes, top_n);
-    }
-
-    state.done.store(true, Ordering::Relaxed);
-}
-
-#[cfg(target_os = "macos")]
-fn walk_dir_bulk<'s>(
-    scope: &rayon::Scope<'s>,
-    dir: PathBuf,
-    state: &'s ScanState,
-    dir_sizes: &'s Mutex<HashMap<PathBuf, u64>>,
-    min_top_size: &'s AtomicU64,
-    dirs_processed: &'s AtomicU64,
-    root: &'s PathBuf,
-    top_n: usize,
-    files_only: bool,
-    stop: &'s AtomicBool,
-) {
-    use std::os::fd::AsRawFd;
-
-    if stop.load(Ordering::Relaxed) {
-        return;
-    }
-
-    // Open dir, bulk-read all entries, close fd before recursing
-    let entries = {
-        let dir_file = match std::fs::File::open(&dir) {
-            Ok(f) => f,
-            Err(_) => {
-                state.error_count.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-        };
-        bulk::read_dir_bulk(dir_file.as_raw_fd())
-        // fd closed here
-    };
-
-    state.dir_count.fetch_add(1, Ordering::Relaxed);
-
-    let mut local_bytes: u64 = 0;
-    let mut local_file_count: u64 = 0;
-    let mut top_candidates: Vec<SizeEntry> = Vec::new();
-    let mut subdirs: Vec<PathBuf> = Vec::new();
-
-    for entry in &entries {
-        if entry.obj_type == bulk::VDIR {
-            subdirs.push(dir.join(&entry.name));
-        } else if entry.obj_type == bulk::VREG {
-            let size = entry.size;
-            local_bytes += size;
-            local_file_count += 1;
-
-            let current_min = min_top_size.load(Ordering::Relaxed);
-            if size > current_min
-                || state.file_count.load(Ordering::Relaxed) + local_file_count
-                    <= top_n as u64
-            {
-                let path_str = dir.join(&entry.name).to_string_lossy().to_string();
-                top_candidates.push(SizeEntry {
-                    path: path_str,
-                    size,
-                });
-            }
-        }
-    }
-
-    // Flush counters (lock-free)
-    state
-        .total_bytes
-        .fetch_add(local_bytes, Ordering::Relaxed);
-    state
-        .file_count
-        .fetch_add(local_file_count, Ordering::Relaxed);
-
-    // Flush top-N file candidates
-    if !top_candidates.is_empty() {
-        let mut lists = state.lists.lock().unwrap();
-        if let Some(last) = top_candidates.last() {
-            lists.current_path = shorten_path(&last.path);
-        }
-        for entry in top_candidates {
-            insert_top_n(&mut lists.top_files, entry, top_n);
-        }
-        min_top_size.store(
-            lists.top_files.last().map(|e| e.size).unwrap_or(0),
-            Ordering::Relaxed,
-        );
-    }
-
-    // Flush dir size accumulation (batched per-directory)
-    if !files_only && local_bytes > 0 {
-        // Pre-compute ancestor chain once for this directory
-        let mut ancestors: Vec<PathBuf> = Vec::new();
-        let mut anc = dir.clone();
-        loop {
-            ancestors.push(anc.clone());
-            if anc == *root {
-                break;
-            }
-            if !anc.pop() || !anc.starts_with(root) {
-                break;
-            }
-        }
-
-        let mut map = dir_sizes.lock().unwrap();
-        for anc in &ancestors {
-            if let Some(v) = map.get_mut(anc) {
-                *v += local_bytes;
-            } else {
-                map.insert(anc.clone(), local_bytes);
-            }
-        }
-        drop(map);
-
-        let count = dirs_processed.fetch_add(1, Ordering::Relaxed);
-        if count % 500 == 0 && count > 0 {
-            flush_top_dirs(state, dir_sizes, top_n);
-        }
-    }
-
-    // Spawn child directories into rayon's work-stealing pool
-    for subdir in subdirs {
-        scope.spawn(move |s| {
-            walk_dir_bulk(
-                s,
-                subdir,
-                state,
-                dir_sizes,
-                min_top_size,
-                dirs_processed,
-                root,
-                top_n,
-                files_only,
-                stop,
-            );
-        });
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn flush_top_dirs(
-    state: &ScanState,
-    dir_sizes: &Mutex<HashMap<PathBuf, u64>>,
-    top_n: usize,
-) {
-    let map = dir_sizes.lock().unwrap();
-    let mut dirs: Vec<SizeEntry> = map
-        .iter()
-        .map(|(p, &s)| SizeEntry {
-            path: p.to_string_lossy().to_string(),
-            size: s,
-        })
-        .collect();
-    drop(map);
-    dirs.sort_unstable_by(|a, b| b.size.cmp(&a.size));
-    dirs.truncate(top_n);
-    state.lists.lock().unwrap().top_dirs = dirs;
-}
-
-// ─── Fallback: jwalk-based scanner for non-macOS ─────────────────────────────
-
-#[cfg(not(target_os = "macos"))]
-fn scan(
-    state: Arc<ScanState>,
-    path: PathBuf,
-    top_n: usize,
-    files_only: bool,
-    stop: Arc<AtomicBool>,
-) {
-    use jwalk::WalkDir;
-
-    let mut dir_sizes: HashMap<PathBuf, u64> = HashMap::new();
-    let mut batch: Vec<SizeEntry> = Vec::with_capacity(1024);
-    let mut batch_bytes: u64 = 0;
-    let mut batch_files: u64 = 0;
-    let mut batch_dirs: u64 = 0;
-    let mut batch_errors: u64 = 0;
-    let mut last_path = String::new();
-    let mut local_file_count: u64 = 0;
-    let mut last_dir_update: u64 = 0;
-    let mut min_top_size: u64 = 0;
-
-    let walker = WalkDir::new(&path)
-        .skip_hidden(false)
-        .follow_links(false)
-        .sort(false);
-
-    for entry in walker {
-        if stop.load(Ordering::Relaxed) {
-            break;
-        }
-
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => {
-                batch_errors += 1;
-                continue;
-            }
-        };
-
-        let metadata = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => {
-                batch_errors += 1;
-                continue;
-            }
-        };
-
-        if metadata.is_file() {
-            #[cfg(unix)]
-            let size = {
-                use std::os::unix::fs::MetadataExt;
-                metadata.blocks() * 512
-            };
-            #[cfg(not(unix))]
-            let size = metadata.len();
-            batch_bytes += size;
-            batch_files += 1;
-            local_file_count += 1;
-
-            let entry_path = entry.path();
-
-            if !files_only {
-                if let Some(parent) = entry_path.parent() {
-                    let mut dir = parent.to_path_buf();
-                    loop {
-                        *dir_sizes.entry(dir.clone()).or_insert(0) += size;
-                        if !dir.pop() || !dir.starts_with(&path) {
-                            break;
-                        }
-                    }
-                }
-            }
-
-            if size > min_top_size || batch_files <= top_n as u64 {
-                let path_str = entry_path.to_string_lossy().to_string();
-                last_path.clone_from(&path_str);
-                batch.push(SizeEntry {
-                    path: path_str,
-                    size,
-                });
-            } else {
-                last_path = entry_path.to_string_lossy().to_string();
-            }
-        } else if metadata.is_dir() {
-            batch_dirs += 1;
-        }
-
-        if batch_files >= 1024 || batch_dirs >= 1024 {
-            state
-                .total_bytes
-                .fetch_add(batch_bytes, Ordering::Relaxed);
-            state
-                .file_count
-                .fetch_add(batch_files, Ordering::Relaxed);
-            state.dir_count.fetch_add(batch_dirs, Ordering::Relaxed);
-            if batch_errors > 0 {
-                state
-                    .error_count
-                    .fetch_add(batch_errors, Ordering::Relaxed);
-            }
-
-            if !batch.is_empty() {
-                let mut lists = state.lists.lock().unwrap();
-                lists.current_path = shorten_path(&last_path);
-                for entry in batch.drain(..) {
-                    insert_top_n(&mut lists.top_files, entry, top_n);
-                }
-                min_top_size = lists.top_files.last().map(|e| e.size).unwrap_or(0);
-            }
-
-            batch_bytes = 0;
-            batch_files = 0;
-            batch_dirs = 0;
-            batch_errors = 0;
-
-            if !files_only && local_file_count - last_dir_update >= 10_000 {
-                last_dir_update = local_file_count;
-                let mut dirs: Vec<SizeEntry> = dir_sizes
-                    .iter()
-                    .map(|(p, &s)| SizeEntry {
-                        path: p.to_string_lossy().to_string(),
-                        size: s,
-                    })
-                    .collect();
-                dirs.sort_unstable_by(|a, b| b.size.cmp(&a.size));
-                dirs.truncate(top_n);
-                state.lists.lock().unwrap().top_dirs = dirs;
-            }
-        }
-    }
-
-    state
-        .total_bytes
-        .fetch_add(batch_bytes, Ordering::Relaxed);
-    state
-        .file_count
-        .fetch_add(batch_files, Ordering::Relaxed);
-    state.dir_count.fetch_add(batch_dirs, Ordering::Relaxed);
-    state
-        .error_count
-        .fetch_add(batch_errors, Ordering::Relaxed);
-
-    if !batch.is_empty() {
-        let mut lists = state.lists.lock().unwrap();
-        for entry in batch.drain(..) {
-            insert_top_n(&mut lists.top_files, entry, top_n);
-        }
-    }
-
-    if !files_only {
-        let mut dirs: Vec<SizeEntry> = dir_sizes
-            .iter()
-            .map(|(p, &s)| SizeEntry {
-                path: p.to_string_lossy().to_string(),
-                size: s,
-            })
-            .collect();
-        dirs.sort_unstable_by(|a, b| b.size.cmp(&a.size));
-        dirs.truncate(top_n);
-        state.lists.lock().unwrap().top_dirs = dirs;
-    }
-
-    state.done.store(true, Ordering::Relaxed);
 }
 
 // ─── TUI ──────────────────────────────────────────────────────────────────────
@@ -925,7 +429,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let top_n = cli.top;
     let files_only = cli.files_only;
     let scanner = thread::spawn(move || {
-        scan(scan_state, scan_path_clone, top_n, files_only, scan_stop);
+        scanner::scan(scan_state, scan_path_clone, top_n, files_only, scan_stop);
     });
 
     if cli.no_tui {
@@ -1141,7 +645,7 @@ mod tests {
     fn shorten_path_under_home() {
         let home = match std::env::var("HOME") {
             Ok(h) => h,
-            Err(_) => return, // skip on Windows where HOME isn't set
+            Err(_) => return,
         };
         let input = format!("{}/Documents/file.txt", home);
         assert_eq!(shorten_path(&input), "~/Documents/file.txt");
