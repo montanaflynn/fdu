@@ -7,7 +7,7 @@ use std::{
     },
 };
 
-use crate::{insert_top_n, ScanState, SizeEntry};
+use crate::{insert_top_n, ScanOptions, ScanState, SizeEntry};
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -27,18 +27,19 @@ pub fn scan(
     top_n: usize,
     files_only: bool,
     stop: Arc<AtomicBool>,
+    options: ScanOptions,
 ) {
     #[cfg(target_os = "macos")]
-    macos::scan(state, root, top_n, files_only, stop);
+    macos::scan(state, root, top_n, files_only, stop, options);
 
     #[cfg(target_os = "linux")]
-    linux::scan(state, root, top_n, files_only, stop);
+    linux::scan(state, root, top_n, files_only, stop, options);
 
     #[cfg(target_os = "windows")]
-    windows::scan(state, root, top_n, files_only, stop);
+    windows::scan(state, root, top_n, files_only, stop, options);
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    fallback::scan(state, root, top_n, files_only, stop);
+    fallback::scan(state, root, top_n, files_only, stop, options);
 }
 
 pub(crate) fn flush_top_dirs(

@@ -49,6 +49,18 @@ struct Cli {
     /// Print results to stdout without TUI (for benchmarks/scripting)
     #[arg(long = "no-tui")]
     no_tui: bool,
+
+    /// Maximum directory depth to recurse
+    #[arg(long = "max-depth")]
+    max_depth: Option<usize>,
+
+    /// Exclude entries matching these names (can be repeated)
+    #[arg(long = "exclude")]
+    exclude: Vec<String>,
+
+    /// Stay on the same filesystem (don't cross mount points)
+    #[arg(long = "one-file-system")]
+    one_file_system: bool,
 }
 
 #[derive(Clone)]
@@ -89,6 +101,43 @@ impl ScanState {
             done: AtomicBool::new(false),
         }
     }
+}
+
+pub(crate) struct ScanOptions {
+    pub max_depth: Option<usize>,
+    pub exclude: Vec<String>,
+    pub one_file_system: bool,
+    pub root_dev: u64,
+}
+
+pub(crate) fn glob_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0, 0);
+    let (mut star_pi, mut star_ti) = (usize::MAX, 0);
+
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star_pi = pi;
+            star_ti = ti;
+            pi += 1;
+        } else if star_pi != usize::MAX {
+            pi = star_pi + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+
+    pi == p.len()
 }
 
 fn parse_size(s: &str) -> Result<u64, String> {
@@ -579,11 +628,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scan_path_clone = path.clone();
     let top_n = cli.top;
     let files_only = cli.files_only;
+    let no_tui = cli.no_tui;
+
+    #[cfg(unix)]
+    let root_dev = if cli.one_file_system {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(&path).map(|m| m.dev()).unwrap_or(0)
+    } else {
+        0
+    };
+    #[cfg(not(unix))]
+    let root_dev: u64 = 0;
+
+    let options = ScanOptions {
+        max_depth: cli.max_depth,
+        exclude: cli.exclude,
+        one_file_system: cli.one_file_system,
+        root_dev,
+    };
+
     let scanner = thread::spawn(move || {
-        scanner::scan(scan_state, scan_path_clone, top_n, files_only, scan_stop);
+        scanner::scan(scan_state, scan_path_clone, top_n, files_only, scan_stop, options);
     });
 
-    if cli.no_tui {
+    if no_tui {
         scanner.join().unwrap();
         let data = snapshot(&state);
         println!(
@@ -914,5 +982,35 @@ mod tests {
     fn shorten_path_not_under_home() {
         let path = "/tmp/some/other/path";
         assert_eq!(shorten_path(path), path);
+    }
+
+    // ── glob_match tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn glob_exact_match() {
+        assert!(glob_match("node_modules", "node_modules"));
+        assert!(!glob_match("node_modules", "node_module"));
+    }
+
+    #[test]
+    fn glob_star_pattern() {
+        assert!(glob_match("*.log", "error.log"));
+        assert!(glob_match("*.log", ".log"));
+        assert!(!glob_match("*.log", "error.txt"));
+        assert!(glob_match("build*", "build"));
+        assert!(glob_match("build*", "build-output"));
+        assert!(glob_match("*test*", "my_test_file"));
+    }
+
+    #[test]
+    fn glob_question_mark() {
+        assert!(glob_match("?.txt", "a.txt"));
+        assert!(!glob_match("?.txt", "ab.txt"));
+    }
+
+    #[test]
+    fn glob_combined() {
+        assert!(glob_match("*.t?t", "file.txt"));
+        assert!(!glob_match("*.t?t", "file.text"));
     }
 }

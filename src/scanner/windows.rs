@@ -14,7 +14,7 @@ use windows::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_REPARSE_POINT,
 };
 
-use crate::{insert_top_n, shorten_path, ScanState, SizeEntry};
+use crate::{glob_match, insert_top_n, shorten_path, ScanOptions, ScanState, SizeEntry};
 use super::{flush_dir_sizes, flush_top_dirs, insert_dir_file};
 
 pub fn scan(
@@ -23,6 +23,7 @@ pub fn scan(
     top_n: usize,
     files_only: bool,
     stop: Arc<AtomicBool>,
+    options: ScanOptions,
 ) {
     let dir_sizes: Mutex<HashMap<PathBuf, u64>> = Mutex::new(HashMap::new());
     let per_dir_files: Mutex<HashMap<String, Vec<SizeEntry>>> = Mutex::new(HashMap::new());
@@ -32,7 +33,7 @@ pub fn scan(
     rayon::scope(|scope| {
         walk_dir(
             scope, root.clone(), &state, &dir_sizes, &per_dir_files, &min_top_size,
-            &dirs_processed, &root, top_n, files_only, &stop,
+            &dirs_processed, &root, top_n, files_only, &stop, &options, 0,
         );
     });
 
@@ -61,6 +62,8 @@ fn walk_dir<'s>(
     top_n: usize,
     files_only: bool,
     stop: &'s AtomicBool,
+    options: &'s ScanOptions,
+    depth: usize,
 ) {
     if stop.load(Ordering::Relaxed) {
         return;
@@ -108,10 +111,18 @@ fn walk_dir<'s>(
 
         if attrs & FILE_ATTRIBUTE_REPARSE_POINT.0 == 0 {
             if !is_dot_dir(&find_data.cFileName) {
+                let name_len = find_data.cFileName.iter().position(|&c| c == 0)
+                    .unwrap_or(find_data.cFileName.len());
+                let name = String::from_utf16_lossy(&find_data.cFileName[..name_len]);
+
+                if !options.exclude.is_empty()
+                    && options.exclude.iter().any(|e| glob_match(e, &name))
+                {
+                    has_entry = unsafe { FindNextFileW(handle, &mut find_data).is_ok() };
+                    continue;
+                }
+
                 if attrs & FILE_ATTRIBUTE_DIRECTORY.0 != 0 {
-                    let name_len = find_data.cFileName.iter().position(|&c| c == 0)
-                        .unwrap_or(find_data.cFileName.len());
-                    let name = String::from_utf16_lossy(&find_data.cFileName[..name_len]);
                     subdirs.push(dir.join(&name));
                 } else {
                     let size = (find_data.nFileSizeHigh as u64) << 32
@@ -119,9 +130,6 @@ fn walk_dir<'s>(
                     local_bytes += size;
                     local_file_count += 1;
 
-                    let name_len = find_data.cFileName.iter().position(|&c| c == 0)
-                        .unwrap_or(find_data.cFileName.len());
-                    let name = String::from_utf16_lossy(&find_data.cFileName[..name_len]);
                     let path_str = dir.join(&name).to_string_lossy().to_string();
                     let file_entry = SizeEntry { path: path_str, size };
 
@@ -168,9 +176,11 @@ fn walk_dir<'s>(
         flush_dir_sizes(&dir, local_bytes, state, dir_sizes, per_dir_files, dirs_processed, root, top_n);
     }
 
-    for subdir in subdirs {
-        scope.spawn(move |s| {
-            walk_dir(s, subdir, state, dir_sizes, per_dir_files, min_top_size, dirs_processed, root, top_n, files_only, stop);
-        });
+    if options.max_depth.map_or(true, |md| depth < md) {
+        for subdir in subdirs {
+            scope.spawn(move |s| {
+                walk_dir(s, subdir, state, dir_sizes, per_dir_files, min_top_size, dirs_processed, root, top_n, files_only, stop, options, depth + 1);
+            });
+        }
     }
 }

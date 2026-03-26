@@ -9,7 +9,7 @@ use std::{
 
 use jwalk::WalkDir;
 
-use crate::{insert_top_n, shorten_path, ScanState, SizeEntry};
+use crate::{glob_match, insert_top_n, shorten_path, ScanOptions, ScanState, SizeEntry};
 
 pub fn scan(
     state: Arc<ScanState>,
@@ -17,6 +17,7 @@ pub fn scan(
     top_n: usize,
     files_only: bool,
     stop: Arc<AtomicBool>,
+    options: ScanOptions,
 ) {
     let mut dir_sizes: HashMap<PathBuf, u64> = HashMap::new();
     let mut batch: Vec<SizeEntry> = Vec::with_capacity(1024);
@@ -29,10 +30,13 @@ pub fn scan(
     let mut last_dir_update: u64 = 0;
     let mut min_top_size: u64 = 0;
 
-    let walker = WalkDir::new(&path)
+    let mut walker = WalkDir::new(&path)
         .skip_hidden(false)
         .follow_links(false)
         .sort(false);
+    if let Some(md) = options.max_depth {
+        walker = walker.max_depth(md + 1);
+    }
 
     for entry in walker {
         if stop.load(Ordering::Relaxed) {
@@ -47,6 +51,26 @@ pub fn scan(
             }
         };
 
+        // Check exclude
+        if !options.exclude.is_empty() {
+            let should_exclude = entry
+                .path()
+                .strip_prefix(&path)
+                .unwrap_or(&entry.path())
+                .components()
+                .any(|c| {
+                    if let std::path::Component::Normal(name) = c {
+                        name.to_str()
+                            .map_or(false, |n| options.exclude.iter().any(|e| glob_match(e, n)))
+                    } else {
+                        false
+                    }
+                });
+            if should_exclude {
+                continue;
+            }
+        }
+
         let metadata = match entry.metadata() {
             Ok(m) => m,
             Err(_) => {
@@ -54,6 +78,15 @@ pub fn scan(
                 continue;
             }
         };
+
+        // Check one-file-system
+        #[cfg(unix)]
+        if options.one_file_system && options.root_dev != 0 {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.dev() != options.root_dev {
+                continue;
+            }
+        }
 
         if metadata.is_file() {
             #[cfg(unix)]

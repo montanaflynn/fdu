@@ -7,7 +7,7 @@ use std::{
     },
 };
 
-use crate::{insert_top_n, shorten_path, ScanState, SizeEntry};
+use crate::{glob_match, insert_top_n, shorten_path, ScanOptions, ScanState, SizeEntry};
 use super::{flush_dir_sizes, flush_top_dirs, insert_dir_file};
 
 pub fn scan(
@@ -16,6 +16,7 @@ pub fn scan(
     top_n: usize,
     files_only: bool,
     stop: Arc<AtomicBool>,
+    options: ScanOptions,
 ) {
     let dir_sizes: Mutex<HashMap<PathBuf, u64>> = Mutex::new(HashMap::new());
     let per_dir_files: Mutex<HashMap<String, Vec<SizeEntry>>> = Mutex::new(HashMap::new());
@@ -25,7 +26,7 @@ pub fn scan(
     rayon::scope(|scope| {
         walk_dir(
             scope, root.clone(), &state, &dir_sizes, &per_dir_files, &min_top_size,
-            &dirs_processed, &root, top_n, files_only, &stop,
+            &dirs_processed, &root, top_n, files_only, &stop, &options, 0,
         );
     });
 
@@ -48,6 +49,8 @@ fn walk_dir<'s>(
     top_n: usize,
     files_only: bool,
     stop: &'s AtomicBool,
+    options: &'s ScanOptions,
+    depth: usize,
 ) {
     use std::os::unix::fs::MetadataExt;
 
@@ -79,6 +82,14 @@ fn walk_dir<'s>(
                 continue;
             }
         };
+
+        if !options.exclude.is_empty() {
+            if let Some(name) = entry.file_name().to_str() {
+                if options.exclude.iter().any(|e| glob_match(e, name)) {
+                    continue;
+                }
+            }
+        }
 
         let file_type = match entry.file_type() {
             Ok(ft) => ft,
@@ -140,9 +151,18 @@ fn walk_dir<'s>(
         flush_dir_sizes(&dir, local_bytes, state, dir_sizes, per_dir_files, dirs_processed, root, top_n);
     }
 
-    for subdir in subdirs {
-        scope.spawn(move |s| {
-            walk_dir(s, subdir, state, dir_sizes, per_dir_files, min_top_size, dirs_processed, root, top_n, files_only, stop);
-        });
+    if options.max_depth.map_or(true, |md| depth < md) {
+        for subdir in subdirs {
+            if options.one_file_system && options.root_dev != 0 {
+                if let Ok(meta) = std::fs::metadata(&subdir) {
+                    if meta.dev() != options.root_dev {
+                        continue;
+                    }
+                }
+            }
+            scope.spawn(move |s| {
+                walk_dir(s, subdir, state, dir_sizes, per_dir_files, min_top_size, dirs_processed, root, top_n, files_only, stop, options, depth + 1);
+            });
+        }
     }
 }
