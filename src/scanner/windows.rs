@@ -15,7 +15,7 @@ use windows::Win32::Storage::FileSystem::{
 };
 
 use crate::{insert_top_n, shorten_path, ScanState, SizeEntry};
-use super::{flush_dir_sizes, flush_top_dirs};
+use super::{flush_dir_sizes, flush_top_dirs, insert_dir_file};
 
 pub fn scan(
     state: Arc<ScanState>,
@@ -25,32 +25,24 @@ pub fn scan(
     stop: Arc<AtomicBool>,
 ) {
     let dir_sizes: Mutex<HashMap<PathBuf, u64>> = Mutex::new(HashMap::new());
+    let per_dir_files: Mutex<HashMap<String, Vec<SizeEntry>>> = Mutex::new(HashMap::new());
     let min_top_size = AtomicU64::new(0);
     let dirs_processed = AtomicU64::new(0);
 
     rayon::scope(|scope| {
         walk_dir(
-            scope,
-            root.clone(),
-            &state,
-            &dir_sizes,
-            &min_top_size,
-            &dirs_processed,
-            &root,
-            top_n,
-            files_only,
-            &stop,
+            scope, root.clone(), &state, &dir_sizes, &per_dir_files, &min_top_size,
+            &dirs_processed, &root, top_n, files_only, &stop,
         );
     });
 
     if !files_only {
-        flush_top_dirs(&state, &dir_sizes, top_n);
+        flush_top_dirs(&state, &dir_sizes, &per_dir_files, top_n);
     }
 
     state.done.store(true, Ordering::Relaxed);
 }
 
-/// Returns true if the filename is "." or ".."
 fn is_dot_dir(name: &[u16]) -> bool {
     let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
     (len == 1 && name[0] == b'.' as u16)
@@ -62,6 +54,7 @@ fn walk_dir<'s>(
     dir: PathBuf,
     state: &'s ScanState,
     dir_sizes: &'s Mutex<HashMap<PathBuf, u64>>,
+    per_dir_files: &'s Mutex<HashMap<String, Vec<SizeEntry>>>,
     min_top_size: &'s AtomicU64,
     dirs_processed: &'s AtomicU64,
     root: &'s PathBuf,
@@ -73,7 +66,6 @@ fn walk_dir<'s>(
         return;
     }
 
-    // Build the search pattern: dir\*  (null-terminated UTF-16)
     let pattern: Vec<u16> = dir
         .join("*")
         .as_os_str()
@@ -108,66 +100,55 @@ fn walk_dir<'s>(
     let mut local_file_count: u64 = 0;
     let mut top_candidates: Vec<SizeEntry> = Vec::new();
     let mut subdirs: Vec<PathBuf> = Vec::new();
+    let dir_str = dir.to_string_lossy().to_string();
 
-    // Process entries starting with the first one already in find_data
     let mut has_entry = true;
     while has_entry {
         let attrs = find_data.dwFileAttributes;
 
-        // Skip symlinks and junctions (reparse points)
         if attrs & FILE_ATTRIBUTE_REPARSE_POINT.0 == 0 {
-            // Skip . and ..
             if !is_dot_dir(&find_data.cFileName) {
                 if attrs & FILE_ATTRIBUTE_DIRECTORY.0 != 0 {
-                    // Directory
-                    let name_len = find_data
-                        .cFileName
-                        .iter()
-                        .position(|&c| c == 0)
+                    let name_len = find_data.cFileName.iter().position(|&c| c == 0)
                         .unwrap_or(find_data.cFileName.len());
                     let name = String::from_utf16_lossy(&find_data.cFileName[..name_len]);
                     subdirs.push(dir.join(&name));
                 } else {
-                    // File — size is inline in the find data
                     let size = (find_data.nFileSizeHigh as u64) << 32
                         | find_data.nFileSizeLow as u64;
                     local_bytes += size;
                     local_file_count += 1;
+
+                    let name_len = find_data.cFileName.iter().position(|&c| c == 0)
+                        .unwrap_or(find_data.cFileName.len());
+                    let name = String::from_utf16_lossy(&find_data.cFileName[..name_len]);
+                    let path_str = dir.join(&name).to_string_lossy().to_string();
+                    let file_entry = SizeEntry { path: path_str, size };
+
+                    if !files_only {
+                        insert_dir_file(per_dir_files, &dir_str, file_entry.clone(), top_n);
+                    }
 
                     let current_min = min_top_size.load(Ordering::Relaxed);
                     if size > current_min
                         || state.file_count.load(Ordering::Relaxed) + local_file_count
                             <= top_n as u64
                     {
-                        let name_len = find_data
-                            .cFileName
-                            .iter()
-                            .position(|&c| c == 0)
-                            .unwrap_or(find_data.cFileName.len());
-                        let name = String::from_utf16_lossy(&find_data.cFileName[..name_len]);
-                        let path_str = dir.join(&name).to_string_lossy().to_string();
-                        top_candidates.push(SizeEntry {
-                            path: path_str,
-                            size,
-                        });
+                        top_candidates.push(file_entry);
                     }
                 }
             }
         }
 
-        // Advance to next entry
         has_entry = unsafe { FindNextFileW(handle, &mut find_data).is_ok() };
     }
 
-    // Always close the find handle
     unsafe {
         let _ = FindClose(handle);
     }
 
     state.total_bytes.fetch_add(local_bytes, Ordering::Relaxed);
-    state
-        .file_count
-        .fetch_add(local_file_count, Ordering::Relaxed);
+    state.file_count.fetch_add(local_file_count, Ordering::Relaxed);
 
     if !top_candidates.is_empty() {
         let mut lists = state.lists.lock().unwrap();
@@ -184,31 +165,12 @@ fn walk_dir<'s>(
     }
 
     if !files_only && local_bytes > 0 {
-        flush_dir_sizes(
-            &dir,
-            local_bytes,
-            state,
-            dir_sizes,
-            dirs_processed,
-            root,
-            top_n,
-        );
+        flush_dir_sizes(&dir, local_bytes, state, dir_sizes, per_dir_files, dirs_processed, root, top_n);
     }
 
     for subdir in subdirs {
         scope.spawn(move |s| {
-            walk_dir(
-                s,
-                subdir,
-                state,
-                dir_sizes,
-                min_top_size,
-                dirs_processed,
-                root,
-                top_n,
-                files_only,
-                stop,
-            );
+            walk_dir(s, subdir, state, dir_sizes, per_dir_files, min_top_size, dirs_processed, root, top_n, files_only, stop);
         });
     }
 }

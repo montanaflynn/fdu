@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::{insert_top_n, shorten_path, ScanState, SizeEntry};
-use super::{flush_dir_sizes, flush_top_dirs};
+use super::{flush_dir_sizes, flush_top_dirs, insert_dir_file};
 
 pub fn scan(
     state: Arc<ScanState>,
@@ -18,18 +18,19 @@ pub fn scan(
     stop: Arc<AtomicBool>,
 ) {
     let dir_sizes: Mutex<HashMap<PathBuf, u64>> = Mutex::new(HashMap::new());
+    let per_dir_files: Mutex<HashMap<String, Vec<SizeEntry>>> = Mutex::new(HashMap::new());
     let min_top_size = AtomicU64::new(0);
     let dirs_processed = AtomicU64::new(0);
 
     rayon::scope(|scope| {
         walk_dir(
-            scope, root.clone(), &state, &dir_sizes, &min_top_size,
+            scope, root.clone(), &state, &dir_sizes, &per_dir_files, &min_top_size,
             &dirs_processed, &root, top_n, files_only, &stop,
         );
     });
 
     if !files_only {
-        flush_top_dirs(&state, &dir_sizes, top_n);
+        flush_top_dirs(&state, &dir_sizes, &per_dir_files, top_n);
     }
 
     state.done.store(true, Ordering::Relaxed);
@@ -40,6 +41,7 @@ fn walk_dir<'s>(
     dir: PathBuf,
     state: &'s ScanState,
     dir_sizes: &'s Mutex<HashMap<PathBuf, u64>>,
+    per_dir_files: &'s Mutex<HashMap<String, Vec<SizeEntry>>>,
     min_top_size: &'s AtomicU64,
     dirs_processed: &'s AtomicU64,
     root: &'s PathBuf,
@@ -67,6 +69,7 @@ fn walk_dir<'s>(
     let mut local_file_count: u64 = 0;
     let mut top_candidates: Vec<SizeEntry> = Vec::new();
     let mut subdirs: Vec<PathBuf> = Vec::new();
+    let dir_str = dir.to_string_lossy().to_string();
 
     for entry in entries {
         let entry = match entry {
@@ -100,12 +103,18 @@ fn walk_dir<'s>(
             local_bytes += size;
             local_file_count += 1;
 
+            let path_str = entry.path().to_string_lossy().to_string();
+            let file_entry = SizeEntry { path: path_str, size };
+
+            if !files_only {
+                insert_dir_file(per_dir_files, &dir_str, file_entry.clone(), top_n);
+            }
+
             let current_min = min_top_size.load(Ordering::Relaxed);
             if size > current_min
                 || state.file_count.load(Ordering::Relaxed) + local_file_count <= top_n as u64
             {
-                let path_str = entry.path().to_string_lossy().to_string();
-                top_candidates.push(SizeEntry { path: path_str, size });
+                top_candidates.push(file_entry);
             }
         }
     }
@@ -128,12 +137,12 @@ fn walk_dir<'s>(
     }
 
     if !files_only && local_bytes > 0 {
-        flush_dir_sizes(&dir, local_bytes, state, dir_sizes, dirs_processed, root, top_n);
+        flush_dir_sizes(&dir, local_bytes, state, dir_sizes, per_dir_files, dirs_processed, root, top_n);
     }
 
     for subdir in subdirs {
         scope.spawn(move |s| {
-            walk_dir(s, subdir, state, dir_sizes, min_top_size, dirs_processed, root, top_n, files_only, stop);
+            walk_dir(s, subdir, state, dir_sizes, per_dir_files, min_top_size, dirs_processed, root, top_n, files_only, stop);
         });
     }
 }

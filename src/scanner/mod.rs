@@ -7,7 +7,7 @@ use std::{
     },
 };
 
-use crate::{ScanState, SizeEntry};
+use crate::{insert_top_n, ScanState, SizeEntry};
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -44,6 +44,7 @@ pub fn scan(
 pub(crate) fn flush_top_dirs(
     state: &ScanState,
     dir_sizes: &Mutex<HashMap<PathBuf, u64>>,
+    per_dir_files: &Mutex<HashMap<String, Vec<SizeEntry>>>,
     top_n: usize,
 ) {
     let map = dir_sizes.lock().unwrap();
@@ -57,7 +58,41 @@ pub(crate) fn flush_top_dirs(
     drop(map);
     dirs.sort_unstable_by(|a, b| b.size.cmp(&a.size));
     dirs.truncate(top_n);
-    state.lists.lock().unwrap().top_dirs = dirs;
+
+    // For each top-N dir, collect top-N files from it AND all its subdirectories
+    let pdf = per_dir_files.lock().unwrap();
+    let mut dir_files: HashMap<String, Vec<SizeEntry>> = HashMap::new();
+    for dir in &dirs {
+        let prefix = format!("{}/", dir.path.trim_end_matches('/'));
+        let mut merged: Vec<SizeEntry> = Vec::new();
+        for (dir_key, files) in pdf.iter() {
+            if *dir_key == dir.path || dir_key.starts_with(&prefix) {
+                for f in files {
+                    insert_top_n(&mut merged, f.clone(), top_n);
+                }
+            }
+        }
+        if !merged.is_empty() {
+            dir_files.insert(dir.path.clone(), merged);
+        }
+    }
+    drop(pdf);
+
+    let mut lists = state.lists.lock().unwrap();
+    lists.top_dirs = dirs;
+    lists.dir_files = dir_files;
+}
+
+/// Insert a file into the per-directory top-N file list.
+pub(crate) fn insert_dir_file(
+    per_dir_files: &Mutex<HashMap<String, Vec<SizeEntry>>>,
+    dir_path: &str,
+    entry: SizeEntry,
+    top_n: usize,
+) {
+    let mut map = per_dir_files.lock().unwrap();
+    let list = map.entry(dir_path.to_string()).or_default();
+    insert_top_n(list, entry, top_n);
 }
 
 /// Shared parallel walker logic: accumulate dir sizes for ancestors and periodically flush.
@@ -66,6 +101,7 @@ pub(crate) fn flush_dir_sizes(
     local_bytes: u64,
     state: &ScanState,
     dir_sizes: &Mutex<HashMap<PathBuf, u64>>,
+    per_dir_files: &Mutex<HashMap<String, Vec<SizeEntry>>>,
     dirs_processed: &std::sync::atomic::AtomicU64,
     root: &PathBuf,
     top_n: usize,
@@ -94,6 +130,6 @@ pub(crate) fn flush_dir_sizes(
 
     let count = dirs_processed.fetch_add(1, Ordering::Relaxed);
     if count % 500 == 0 && count > 0 {
-        flush_top_dirs(state, dir_sizes, top_n);
+        flush_top_dirs(state, dir_sizes, per_dir_files, top_n);
     }
 }

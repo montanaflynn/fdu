@@ -16,6 +16,7 @@ use ratatui::{
     Terminal,
 };
 use std::{
+    collections::HashMap,
     io,
     path::PathBuf,
     sync::{
@@ -59,6 +60,7 @@ pub(crate) struct SizeEntry {
 pub(crate) struct ScanLists {
     pub top_files: Vec<SizeEntry>,
     pub top_dirs: Vec<SizeEntry>,
+    pub dir_files: HashMap<String, Vec<SizeEntry>>,
     pub current_path: String,
 }
 
@@ -77,6 +79,7 @@ impl ScanState {
             lists: Mutex::new(ScanLists {
                 top_files: Vec::new(),
                 top_dirs: Vec::new(),
+                dir_files: HashMap::new(),
                 current_path: String::new(),
             }),
             total_bytes: AtomicU64::new(0),
@@ -148,17 +151,19 @@ struct App {
     files_state: TableState,
     dirs_state: TableState,
     files_only: bool,
+    filter_dir: Option<String>,
 }
 
 impl App {
     fn new(files_only: bool) -> Self {
-        let mut files_state = TableState::default();
-        files_state.select(Some(0));
+        let mut dirs_state = TableState::default();
+        dirs_state.select(Some(0));
         Self {
-            active: ActiveTable::Files,
-            files_state,
-            dirs_state: TableState::default(),
+            active: if files_only { ActiveTable::Files } else { ActiveTable::Dirs },
+            files_state: TableState::default(),
+            dirs_state,
             files_only,
+            filter_dir: None,
         }
     }
 
@@ -175,6 +180,9 @@ impl App {
             }
             ActiveTable::Dirs => {
                 self.active = ActiveTable::Files;
+                if self.files_state.selected().is_none() {
+                    self.files_state.select(Some(0));
+                }
             }
         }
     }
@@ -217,6 +225,8 @@ fn render_size_table<'a>(
     is_active: bool,
     min_size: u64,
     area_width: u16,
+    pinned_path: Option<&str>,
+    selected: Option<usize>,
 ) -> (Table<'a>, usize) {
     let border_style = if is_active {
         Style::default().fg(Color::Cyan)
@@ -234,12 +244,30 @@ fn render_size_table<'a>(
             let rank = format!("{:>3}", i + 1);
             let size_str = format_size(entry.size, BINARY);
             let path = truncate_path(&entry.path, path_width);
-            Row::new(vec![
-                Cell::from(rank).style(Style::default().fg(Color::DarkGray)),
+            let is_pinned = pinned_path.is_some_and(|p| p == entry.path);
+            let is_highlighted = is_active && selected == Some(i);
+            let rank_color = if is_pinned {
+                Color::Cyan
+            } else if is_highlighted {
+                Color::Gray
+            } else {
+                Color::DarkGray
+            };
+            let row = Row::new(vec![
+                Cell::from(rank).style(Style::default().fg(rank_color)),
                 Cell::from(format!("{:>10}", size_str))
                     .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                Cell::from(path),
-            ])
+                Cell::from(path).style(if is_pinned {
+                    Style::default().fg(Color::Cyan)
+                } else {
+                    Style::default()
+                }),
+            ]);
+            if is_pinned {
+                row.style(Style::default().bg(Color::Indexed(236)))
+            } else {
+                row
+            }
         })
         .collect();
 
@@ -258,15 +286,11 @@ fn render_size_table<'a>(
             .borders(Borders::ALL)
             .border_style(border_style),
     )
-    .row_highlight_style(
+    .row_highlight_style(if is_active {
+        Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD)
+    } else {
         Style::default()
-            .bg(if is_active {
-                Color::DarkGray
-            } else {
-                Color::Reset
-            })
-            .add_modifier(Modifier::BOLD),
-    );
+    });
 
     (table, count)
 }
@@ -274,6 +298,7 @@ fn render_size_table<'a>(
 struct FrameData {
     top_files: Vec<SizeEntry>,
     top_dirs: Vec<SizeEntry>,
+    dir_files: HashMap<String, Vec<SizeEntry>>,
     total_bytes: u64,
     file_count: u64,
     dir_count: u64,
@@ -286,6 +311,7 @@ fn snapshot(state: &ScanState) -> FrameData {
     FrameData {
         top_files: lists.top_files.clone(),
         top_dirs: lists.top_dirs.clone(),
+        dir_files: lists.dir_files.clone(),
         total_bytes: state.total_bytes.load(Ordering::Relaxed),
         file_count: state.file_count.load(Ordering::Relaxed),
         dir_count: state.dir_count.load(Ordering::Relaxed),
@@ -348,54 +374,79 @@ fn draw_ui(
             true,
             min_size,
             chunks[1].width,
+            None,
+            app.files_state.selected(),
         );
-        f.render_stateful_widget(table, chunks[1], &mut app.files_state);
-        if let Some(sel) = app.files_state.selected() {
+        if count > 0 && app.files_state.selected().is_none() {
+            app.files_state.select(Some(0));
+        } else if let Some(sel) = app.files_state.selected() {
             if sel >= count && count > 0 {
                 app.files_state.select(Some(count - 1));
             }
         }
+        f.render_stateful_widget(table, chunks[1], &mut app.files_state);
     } else {
         let table_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(chunks[1]);
 
-        let files_active = matches!(app.active, ActiveTable::Files);
+        let dirs_active = matches!(app.active, ActiveTable::Dirs);
 
-        let (ft, fc) = render_size_table(
-            &data.top_files,
-            " Largest Files ",
-            files_active,
-            min_size,
-            table_chunks[0].width,
-        );
-        f.render_stateful_widget(ft, table_chunks[0], &mut app.files_state);
-        if let Some(sel) = app.files_state.selected() {
-            if sel >= fc && fc > 0 {
-                app.files_state.select(Some(fc - 1));
-            }
-        }
-
+        // Dirs on top
         let (dt, dc) = render_size_table(
             &data.top_dirs,
             " Largest Directories ",
-            !files_active,
+            dirs_active,
             min_size,
-            table_chunks[1].width,
+            table_chunks[0].width,
+            app.filter_dir.as_deref(),
+            app.dirs_state.selected(),
         );
-        f.render_stateful_widget(dt, table_chunks[1], &mut app.dirs_state);
-        if let Some(sel) = app.dirs_state.selected() {
+        if dc > 0 && app.dirs_state.selected().is_none() {
+            app.dirs_state.select(Some(0));
+        } else if let Some(sel) = app.dirs_state.selected() {
             if sel >= dc && dc > 0 {
                 app.dirs_state.select(Some(dc - 1));
             }
         }
+        f.render_stateful_widget(dt, table_chunks[0], &mut app.dirs_state);
+
+        // Files on bottom — show per-dir files if filtered, else global top
+        let (files_to_show, files_title) = if let Some(ref filter) = app.filter_dir {
+            (
+                data.dir_files.get(filter).cloned().unwrap_or_default(),
+                format!(" Files in {} ", shorten_path(filter)),
+            )
+        } else {
+            (data.top_files.clone(), " Largest Files ".to_string())
+        };
+
+        let (ft, fc) = render_size_table(
+            &files_to_show,
+            &files_title,
+            !dirs_active,
+            min_size,
+            table_chunks[1].width,
+            None,
+            app.files_state.selected(),
+        );
+        if fc > 0 && app.files_state.selected().is_none() {
+            app.files_state.select(Some(0));
+        } else if let Some(sel) = app.files_state.selected() {
+            if sel >= fc && fc > 0 {
+                app.files_state.select(Some(fc - 1));
+            }
+        }
+        f.render_stateful_widget(ft, table_chunks[1], &mut app.files_state);
     }
 
     let footer_text = if app.files_only {
         " q: quit | ↑↓/jk: navigate"
+    } else if app.filter_dir.is_some() {
+        " esc/bksp: clear filter | q: quit | tab: switch | ↑↓/jk: navigate"
     } else {
-        " q: quit | tab: switch table | ↑↓/jk: navigate"
+        " enter: filter by dir | q: quit | tab: switch | ↑↓/jk: navigate"
     };
     let footer = Paragraph::new(footer_text).style(Style::default().fg(Color::DarkGray));
     f.render_widget(footer, chunks[2]);
@@ -489,7 +540,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 start.elapsed()
             };
-            let files_len = data.top_files.len();
+            let files_len = if let Some(ref filter) = app.filter_dir {
+                data.dir_files.get(filter).map(|v| v.len()).unwrap_or(0)
+            } else {
+                data.top_files.len()
+            };
             let dirs_len = data.top_dirs.len();
             terminal.draw(|f| {
                 draw_ui(f, &data, &mut app, elapsed, min_size, &scan_path);
@@ -499,9 +554,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press {
                         match key.code {
-                            KeyCode::Char('q') | KeyCode::Esc => {
+                            KeyCode::Char('q') => {
                                 stop.store(true, Ordering::Relaxed);
                                 break;
+                            }
+                            KeyCode::Esc => {
+                                if app.filter_dir.is_some() {
+                                    app.filter_dir = None;
+                                    app.active = ActiveTable::Dirs;
+                                } else {
+                                    stop.store(true, Ordering::Relaxed);
+                                    break;
+                                }
+                            }
+                            KeyCode::Backspace => {
+                                if app.filter_dir.is_some() {
+                                    app.filter_dir = None;
+                                    app.active = ActiveTable::Dirs;
+                                }
+                            }
+                            KeyCode::Enter => {
+                                if matches!(app.active, ActiveTable::Dirs) {
+                                    if let Some(sel) = app.dirs_state.selected() {
+                                        if sel < data.top_dirs.len() {
+                                            app.filter_dir = Some(data.top_dirs[sel].path.clone());
+                                            app.active = ActiveTable::Files;
+                                            app.files_state.select(Some(0));
+                                        }
+                                    }
+                                }
                             }
                             KeyCode::Tab => app.toggle_table(),
                             KeyCode::Up | KeyCode::Char('k') => app.move_up(),
