@@ -480,10 +480,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let mut app = App::new(files_only);
         let start = Instant::now();
+        let mut final_elapsed = None;
 
         loop {
-            let elapsed = start.elapsed();
             let data = snapshot(&state);
+            let elapsed = if data.done {
+                *final_elapsed.get_or_insert(start.elapsed())
+            } else {
+                start.elapsed()
+            };
             let files_len = data.top_files.len();
             let dirs_len = data.top_dirs.len();
             terminal.draw(|f| {
