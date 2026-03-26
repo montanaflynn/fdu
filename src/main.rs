@@ -9,10 +9,10 @@ use crossterm::{
 use humansize::{format_size, BINARY};
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState},
     Terminal,
 };
 use std::{
@@ -152,6 +152,8 @@ struct App {
     dirs_state: TableState,
     files_only: bool,
     filter_dir: Option<String>,
+    confirm_delete: Option<(String, bool)>, // (path, is_dir)
+    delete_error: Option<String>,
 }
 
 impl App {
@@ -164,6 +166,8 @@ impl App {
             dirs_state,
             files_only,
             filter_dir: None,
+            confirm_delete: None,
+            delete_error: None,
         }
     }
 
@@ -194,6 +198,25 @@ impl App {
         };
         let i = st.selected().unwrap_or(0);
         st.select(Some(i.saturating_sub(1)));
+    }
+
+    fn selected_path(&self, data: &FrameData) -> Option<(String, bool)> {
+        match self.active {
+            ActiveTable::Files => {
+                let files = if let Some(ref filter) = self.filter_dir {
+                    data.dir_files.get(filter).cloned().unwrap_or_default()
+                } else {
+                    data.top_files.clone()
+                };
+                self.files_state
+                    .selected()
+                    .and_then(|i| files.get(i).map(|e| (e.path.clone(), false)))
+            }
+            ActiveTable::Dirs => self
+                .dirs_state
+                .selected()
+                .and_then(|i| data.top_dirs.get(i).map(|e| (e.path.clone(), true))),
+        }
     }
 
     fn move_down(&mut self, max: usize) {
@@ -320,6 +343,12 @@ fn snapshot(state: &ScanState) -> FrameData {
     }
 }
 
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    Rect::new(x, y, width.min(area.width), height.min(area.height))
+}
+
 fn draw_ui(
     f: &mut ratatui::Frame,
     data: &FrameData,
@@ -442,14 +471,85 @@ fn draw_ui(
     }
 
     let footer_text = if app.files_only {
-        " q: quit | ↑↓/jk: navigate"
+        " q: quit | d: delete | ↑↓/jk: navigate"
     } else if app.filter_dir.is_some() {
-        " esc/bksp: clear filter | q: quit | tab: switch | ↑↓/jk: navigate"
+        " esc/bksp: clear filter | d: delete | q: quit | tab: table | ↑↓/jk: navigate"
     } else {
-        " enter: filter by dir | q: quit | tab: switch | ↑↓/jk: navigate"
+        " enter: filter by dir | d: delete | q: quit | tab: table | ↑↓/jk: navigate"
     };
     let footer = Paragraph::new(footer_text).style(Style::default().fg(Color::DarkGray));
     f.render_widget(footer, chunks[2]);
+
+    // Delete confirmation modal
+    if let Some((ref delete_path, _is_dir)) = app.confirm_delete {
+        let modal_width = 50u16.min(f.area().width.saturating_sub(4));
+        let modal_height = 7u16;
+        let area = centered_rect(modal_width, modal_height, f.area());
+
+        f.render_widget(Clear, area);
+
+        let max_path_len = (modal_width as usize).saturating_sub(14);
+        let display_path = truncate_path(delete_path, max_path_len);
+
+        let text = vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::raw("Delete "),
+                Span::styled(
+                    display_path,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("?"),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Are you sure? (Y/n)",
+                Style::default().fg(Color::White),
+            )),
+            Line::from(""),
+        ];
+
+        let modal = Paragraph::new(text)
+            .alignment(Alignment::Center)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Red)),
+            );
+        f.render_widget(modal, area);
+    }
+
+    // Delete error modal
+    if let Some(ref error) = app.delete_error {
+        let modal_width = 50u16.min(f.area().width.saturating_sub(4));
+        let modal_height = 5u16;
+        let area = centered_rect(modal_width, modal_height, f.area());
+
+        f.render_widget(Clear, area);
+
+        let text = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                error.as_str(),
+                Style::default().fg(Color::Red),
+            )),
+            Line::from(Span::styled(
+                "Press any key to dismiss",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+
+        let modal = Paragraph::new(text)
+            .alignment(Alignment::Center)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Red)),
+            );
+        f.render_widget(modal, area);
+    }
 }
 
 // ─── main ─────────────────────────────────────────────────────────────────────
@@ -553,47 +653,120 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if event::poll(Duration::from_millis(100))? {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press {
-                        match key.code {
-                            KeyCode::Char('q') => {
-                                stop.store(true, Ordering::Relaxed);
-                                break;
-                            }
-                            KeyCode::Esc => {
-                                if app.filter_dir.is_some() {
-                                    app.filter_dir = None;
-                                    app.active = ActiveTable::Dirs;
-                                } else {
-                                    stop.store(true, Ordering::Relaxed);
-                                    break;
-                                }
-                            }
-                            KeyCode::Backspace => {
-                                if app.filter_dir.is_some() {
-                                    app.filter_dir = None;
-                                    app.active = ActiveTable::Dirs;
-                                }
-                            }
-                            KeyCode::Enter => {
-                                if matches!(app.active, ActiveTable::Dirs) {
-                                    if let Some(sel) = app.dirs_state.selected() {
-                                        if sel < data.top_dirs.len() {
-                                            app.filter_dir = Some(data.top_dirs[sel].path.clone());
-                                            app.active = ActiveTable::Files;
-                                            app.files_state.select(Some(0));
+                        if app.delete_error.is_some() {
+                            // Any key dismisses the error modal
+                            app.delete_error = None;
+                        } else if app.confirm_delete.is_some() {
+                            match key.code {
+                                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                                    let (path, is_dir) =
+                                        app.confirm_delete.take().unwrap();
+                                    let result = if is_dir {
+                                        std::fs::remove_dir_all(&path)
+                                    } else {
+                                        std::fs::remove_file(&path)
+                                    };
+                                    match result {
+                                        Ok(()) => {
+                                            let mut lists =
+                                                state.lists.lock().unwrap();
+                                            let prefix = format!("{}/", path);
+                                            if is_dir {
+                                                lists.top_dirs.retain(|e| {
+                                                    e.path != path
+                                                        && !e.path.starts_with(&prefix)
+                                                });
+                                                lists.top_files.retain(|e| {
+                                                    !e.path.starts_with(&prefix)
+                                                });
+                                                lists.dir_files.retain(|k, _| {
+                                                    k != &path
+                                                        && !k.starts_with(&prefix)
+                                                });
+                                                if app.filter_dir.as_deref()
+                                                    == Some(path.as_str())
+                                                {
+                                                    app.filter_dir = None;
+                                                    app.active = ActiveTable::Dirs;
+                                                }
+                                            } else {
+                                                lists
+                                                    .top_files
+                                                    .retain(|e| e.path != path);
+                                                for files in
+                                                    lists.dir_files.values_mut()
+                                                {
+                                                    files
+                                                        .retain(|e| e.path != path);
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            app.delete_error =
+                                                Some(format!("Delete failed: {}", e));
                                         }
                                     }
                                 }
+                                KeyCode::Char('n')
+                                | KeyCode::Char('N')
+                                | KeyCode::Esc => {
+                                    app.confirm_delete = None;
+                                }
+                                _ => {}
                             }
-                            KeyCode::Tab => app.toggle_table(),
-                            KeyCode::Up | KeyCode::Char('k') => app.move_up(),
-                            KeyCode::Down | KeyCode::Char('j') => {
-                                let max = match app.active {
-                                    ActiveTable::Files => files_len,
-                                    ActiveTable::Dirs => dirs_len,
-                                };
-                                app.move_down(max);
+                        } else {
+                            match key.code {
+                                KeyCode::Char('q') => {
+                                    stop.store(true, Ordering::Relaxed);
+                                    break;
+                                }
+                                KeyCode::Esc => {
+                                    if app.filter_dir.is_some() {
+                                        app.filter_dir = None;
+                                        app.active = ActiveTable::Dirs;
+                                    } else {
+                                        stop.store(true, Ordering::Relaxed);
+                                        break;
+                                    }
+                                }
+                                KeyCode::Backspace => {
+                                    if app.filter_dir.is_some() {
+                                        app.filter_dir = None;
+                                        app.active = ActiveTable::Dirs;
+                                    }
+                                }
+                                KeyCode::Enter => {
+                                    if matches!(app.active, ActiveTable::Dirs) {
+                                        if let Some(sel) = app.dirs_state.selected()
+                                        {
+                                            if sel < data.top_dirs.len() {
+                                                app.filter_dir = Some(
+                                                    data.top_dirs[sel].path.clone(),
+                                                );
+                                                app.active = ActiveTable::Files;
+                                                app.files_state.select(Some(0));
+                                            }
+                                        }
+                                    }
+                                }
+                                KeyCode::Char('d') => {
+                                    if let Some(target) =
+                                        app.selected_path(&data)
+                                    {
+                                        app.confirm_delete = Some(target);
+                                    }
+                                }
+                                KeyCode::Tab => app.toggle_table(),
+                                KeyCode::Up | KeyCode::Char('k') => app.move_up(),
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    let max = match app.active {
+                                        ActiveTable::Files => files_len,
+                                        ActiveTable::Dirs => dirs_len,
+                                    };
+                                    app.move_down(max);
+                                }
+                                _ => {}
                             }
-                            _ => {}
                         }
                     }
                 }
