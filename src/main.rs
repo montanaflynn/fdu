@@ -398,6 +398,41 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     Rect::new(x, y, width.min(area.width), height.min(area.height))
 }
 
+fn open_path(path: &str, is_dir: bool) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        if is_dir {
+            std::process::Command::new("open").arg(path).spawn()?;
+        } else {
+            // -R reveals the file in Finder
+            std::process::Command::new("open").arg("-R").arg(path).spawn()?;
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if is_dir {
+            std::process::Command::new("xdg-open").arg(path).spawn()?;
+        } else {
+            // Open the parent directory
+            if let Some(parent) = std::path::Path::new(path).parent() {
+                std::process::Command::new("xdg-open").arg(parent).spawn()?;
+            }
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if is_dir {
+            std::process::Command::new("explorer").arg(path).spawn()?;
+        } else {
+            // /select highlights the file in Explorer
+            std::process::Command::new("explorer")
+                .arg(format!("/select,{}", path))
+                .spawn()?;
+        }
+    }
+    Ok(())
+}
+
 fn draw_ui(
     f: &mut ratatui::Frame,
     data: &FrameData,
@@ -520,11 +555,13 @@ fn draw_ui(
     }
 
     let footer_text = if app.files_only {
-        " q: quit | d: delete | ↑↓/jk: navigate"
+        " o: open | d: delete | q: quit | ↑↓/jk: navigate"
     } else if app.filter_dir.is_some() {
-        " esc/bksp: clear filter | d: delete | q: quit | tab: table | ↑↓/jk: navigate"
+        " o: open | esc/bksp: clear filter | d: delete | q: quit | tab: table | ↑↓/jk: navigate"
+    } else if matches!(app.active, ActiveTable::Dirs) {
+        " enter: filter by dir | o: open | d: delete | q: quit | tab: table | ↑↓/jk: navigate"
     } else {
-        " enter: filter by dir | d: delete | q: quit | tab: table | ↑↓/jk: navigate"
+        " o: open | d: delete | q: quit | tab: table | ↑↓/jk: navigate"
     };
     let footer = Paragraph::new(footer_text).style(Style::default().fg(Color::DarkGray));
     f.render_widget(footer, chunks[2]);
@@ -815,6 +852,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 app.files_state.select(Some(0));
                                             }
                                         }
+                                    }
+                                }
+                                KeyCode::Char('o') => {
+                                    if let Some((path, is_dir)) =
+                                        app.selected_path(&data)
+                                    {
+                                        let _ = open_path(&path, is_dir);
                                     }
                                 }
                                 KeyCode::Char('d') => {
